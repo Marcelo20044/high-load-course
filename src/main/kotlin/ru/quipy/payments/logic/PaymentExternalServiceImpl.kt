@@ -50,12 +50,7 @@ class PaymentExternalSystemAdapterImpl(
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
 
-        if (!limiter.tick()) {
-            paymentESService.update(paymentId) {
-                it.logProcessing(success = false, now(), transactionId, "Rate limited")
-            }
-            return
-        }
+        limiter.tickBlocking(Duration.ofSeconds(1))
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
