@@ -38,7 +38,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder().build()
 
-    private var semaphore = Semaphore(5)
+    private var semaphore = Semaphore(5, true)
     private val limiter = SlidingWindowRateLimiter(3, Duration.ofSeconds(1))
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
