@@ -61,8 +61,7 @@ class PaymentAccountsConfig {
                     it,
                     paymentService,
                     paymentProviderHostPort,
-                    token,
-                    metrics
+                    token
                 )
             }
     }
