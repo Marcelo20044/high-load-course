@@ -62,12 +62,12 @@ class PaymentExternalSystemAdapterImpl(
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
 
-        semaphore.acquire()
+        limiter.tickBlocking(Duration.ofSeconds(1))
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
         try {
-            limiter.tickBlocking(Duration.ofSeconds(1))
+            semaphore.acquire()
 
             val request = Request.Builder().run {
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
