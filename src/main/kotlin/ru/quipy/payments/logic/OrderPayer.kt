@@ -6,7 +6,6 @@ import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
 import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
 import ru.quipy.common.utils.NamedThreadFactory
-import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.util.*
@@ -36,13 +35,9 @@ class OrderPayer(registry: MeterRegistry) {
         16,
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(8_000),
+        LinkedBlockingQueue(200),
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
-    )
-
-    private val limiter = SlidingWindowRateLimiter(
-        16, Duration.ofSeconds(1)
     )
 
     private val acceptedCounter: Counter = Counter
@@ -62,12 +57,6 @@ class OrderPayer(registry: MeterRegistry) {
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = now()
-
-        if (!limiter.tick()) {
-            rejectedCounter.increment()
-            val retryAfter = now() + Duration.ofSeconds(1).toMillis()
-            throw TooManyRequestsException(retryAfter)
-        }
 
         if (paymentExecutor.queue.remainingCapacity() == 0) {
             rejectedCounter.increment()
