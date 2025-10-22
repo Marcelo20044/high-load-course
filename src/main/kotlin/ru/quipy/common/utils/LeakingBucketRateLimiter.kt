@@ -25,8 +25,8 @@ class LeakingBucketRateLimiter(
     private val releaseJob = rateLimiterScope.launch {
         while (true) {
             delay(window.toMillis())
-            for (i in 0..rate) {
-                queue.poll()
+            repeat(rate.toInt()) {
+                queue.poll() ?: return@repeat
             }
         }
     }.invokeOnCompletion { th -> if (th != null) logger.error("Rate limiter release job completed", th) }
