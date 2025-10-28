@@ -40,7 +40,7 @@ class OrderPayer(registry: MeterRegistry) {
         16,
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(250),
+        LinkedBlockingQueue(128),
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
@@ -49,10 +49,11 @@ class OrderPayer(registry: MeterRegistry) {
         .builder("payments.accepted")
         .register(registry)
 
-    private val rejectedCounter: Counter = Counter
-        .builder("payments.rejected")
-        .tag("code", "429")
-        .register(registry)
+    private val rejectedExpired = registry.counter("payments.rejected", "code", "429", "reason", "expired")
+    private val rejectedDeadline = registry.counter("payments.rejected", "code", "429", "reason", "deadline_budget")
+    private val rejectedLimiter  = registry.counter("payments.rejected", "code", "429", "reason", "limiter_throttle")
+    private val rejectedQueue    = registry.counter("payments.rejected", "code", "429", "reason", "queue_overflow")
+
 
     init {
         Gauge.builder("waiting.queue.size") { paymentExecutor.queue.size.toDouble() }
@@ -60,7 +61,7 @@ class OrderPayer(registry: MeterRegistry) {
             .register(registry)
     }
 
-    private val ingressRate = 11
+    private val ingressRate = 10
     private val ingressLimiter = CompositeRateLimiter(
         TokenBucketRateLimiter(
             rate = ingressRate,
@@ -74,43 +75,34 @@ class OrderPayer(registry: MeterRegistry) {
         )
     )
 
-    private val ingressRejectedCounter: Counter = Counter
-        .builder("payments.ingress.rejected")
-        .tag("code", "429")
-        .register(registry)
-
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = now()
         val timeBudgetMs = deadline - createdAt
         if (timeBudgetMs <= 0L) {
-            ingressRejectedCounter.increment()
+            rejectedExpired.increment()
             throw TooManyRequestsException(100)
         }
 
         val qSize = paymentExecutor.queue.size + 1
         val qWaitMs = ((qSize.toDouble() / ingressRate) * 1000).toLong()
-        val avgProcMs = 1000L
-        val jitterMs = 300L
+        val avgProcMs = 700L
+        val jitterMs = 200L
         val safety = avgProcMs + jitterMs
         if (qWaitMs + safety >= timeBudgetMs) {
-            ingressRejectedCounter.increment()
-            val retryBase = ceil(1000.0 / ingressRate).toLong()
-            val backoffMs = (retryBase + min(qWaitMs, 2000)).coerceIn(50, 3000)
+            rejectedDeadline.increment()
+            val backoffMs = (1000.0 / ingressRate).toLong().coerceAtLeast(100)
             throw TooManyRequestsException(backoffMs)
         }
 
         if (!ingressLimiter.tick()) {
-            ingressRejectedCounter.increment()
-            val retryBase = ceil(1000.0 / ingressRate).toLong()
-            val qWaitMs = ((paymentExecutor.queue.size.toDouble() / ingressRate) * 1000).toLong()
-            val backoffMs = (retryBase + min(qWaitMs, 2000)).coerceIn(50, 3000)
+            rejectedLimiter.increment()
+            val backoffMs = 120L
             throw TooManyRequestsException(backoffMs)
         }
 
         if (paymentExecutor.queue.remainingCapacity() == 0) {
-            rejectedCounter.increment()
-            val backoffMs = (5 * ceil(1000.0 / ingressRate)).toLong()
-            throw TooManyRequestsException(backoffMs)
+            rejectedQueue.increment()
+            throw TooManyRequestsException(200)
         }
 
         acceptedCounter.increment()

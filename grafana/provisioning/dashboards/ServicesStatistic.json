@@ -200,15 +200,78 @@
         },
         "overrides": [
           {
-            "matcher": { "id": "byName", "options": "accepted" },
+            "matcher": {
+              "id": "byName",
+              "options": "accepted"
+            },
             "properties": [
-              { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
             ]
           },
           {
-            "matcher": { "id": "byName", "options": "rejected (429 Too Many Requests)" },
+            "matcher": {
+              "id": "byName",
+              "options": "deadline_budget (429)"
+            },
             "properties": [
-              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "limiter_throttle (429)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "queue_overflow (429)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "purple"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "expired (429)"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
             ]
           }
         ]
@@ -235,17 +298,16 @@
       },
       "pluginVersion": "12.1.1",
       "targets": [
-        {
-          "disableTextWrap": false,
-          "editorMode": "builder",
-          "expr": "rate(payments_rejected_total{code=\"429\"}[1m])",
-          "fullMetaSearch": false,
-          "includeNullMetadata": true,
-          "legendFormat": "rejected (429 Too Many Requests)",
-          "range": true,
-          "refId": "A",
-          "useBackend": false
-        },
+        { "expr": "rate(payments_rejected_total{code=\"429\",reason=\"deadline_budget\"}[1m])",
+          "legendFormat": "deadline_budget (429)", "refId": "A" },
+
+        { "expr": "rate(payments_rejected_total{code=\"429\",reason=\"limiter_throttle\"}[1m])",
+          "legendFormat": "limiter_throttle (429)", "refId": "C" },
+
+        { "expr": "rate(payments_rejected_total{code=\"429\",reason=\"queue_overflow\"}[1m])",
+          "legendFormat": "queue_overflow (429)", "refId": "D" },
+        { "expr": "rate(payments_rejected_total{code=\"429\",reason=\"expired\"}[1m])",
+          "legendFormat": "expired (429)", "refId": "E" },
         {
           "datasource": {
             "type": "prometheus",

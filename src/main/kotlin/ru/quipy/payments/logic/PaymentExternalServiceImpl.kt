@@ -43,18 +43,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private var semaphore = Semaphore(parallelRequests, true)
 
-    private val safeRps: Long = minOf(
-        properties.rateLimitPerSec.toLong(),
-        kotlin.math.max(1.0, kotlin.math.floor(
-            properties.parallelRequests / (properties.averageProcessingTime.toMillis() / 1000.0)
-        )).toLong()
-    )
-    private val limiter = TokenBucketRateLimiter(
-        rate = safeRps.toInt(),
-        bucketMaxCapacity = safeRps.toInt(),
-        window = 1,
-        timeUnit = TimeUnit.SECONDS
-    )
+    private val limiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
 
@@ -73,9 +62,7 @@ class PaymentExternalSystemAdapterImpl(
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
         try {
-            while (!limiter.tick()) {
-                Thread.sleep(ceil(1000.0 / safeRps).toLong())
-            }
+            limiter.tickBlocking(Duration.ofMillis(200))
 
             val request = Request.Builder().run {
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
