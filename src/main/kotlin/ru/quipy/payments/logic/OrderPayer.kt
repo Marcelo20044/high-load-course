@@ -36,11 +36,11 @@ class OrderPayer(registry: MeterRegistry) {
     private lateinit var paymentService: PaymentService
 
     private val paymentExecutor = ThreadPoolExecutor(
-        16,
-        16,
+        50,
+        50,
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(128),
+        LinkedBlockingQueue(256),
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
@@ -85,24 +85,28 @@ class OrderPayer(registry: MeterRegistry) {
 
         val qSize = paymentExecutor.queue.size + 1
         val qWaitMs = ((qSize.toDouble() / ingressRate) * 1000).toLong()
-        val avgProcMs = 700L
-        val jitterMs = 200L
+        val avgProcMs = 1000L
+        val jitterMs = 300L
         val safety = avgProcMs + jitterMs
         if (qWaitMs + safety >= timeBudgetMs) {
             rejectedDeadline.increment()
-            val backoffMs = (1000.0 / ingressRate).toLong().coerceAtLeast(100)
+            val retryBase = ceil(1000.0 / ingressRate).toLong()
+            val backoffMs = (retryBase + min(qWaitMs, 2000)).coerceIn(50, 3000)
             throw TooManyRequestsException(backoffMs)
         }
 
         if (!ingressLimiter.tick()) {
             rejectedLimiter.increment()
-            val backoffMs = 120L
+            val retryBase = ceil(1000.0 / ingressRate).toLong()
+            val qWaitMs = ((paymentExecutor.queue.size.toDouble() / ingressRate) * 1000).toLong()
+            val backoffMs = (retryBase + min(qWaitMs, 2000)).coerceIn(50, 3000)
             throw TooManyRequestsException(backoffMs)
         }
 
         if (paymentExecutor.queue.remainingCapacity() == 0) {
             rejectedQueue.increment()
-            throw TooManyRequestsException(200)
+            val backoffMs = (5 * ceil(1000.0 / ingressRate)).toLong()
+            throw TooManyRequestsException(backoffMs)
         }
 
         acceptedCounter.increment()
