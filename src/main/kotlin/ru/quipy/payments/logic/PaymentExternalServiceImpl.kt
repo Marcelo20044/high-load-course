@@ -44,7 +44,13 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
     private val maxRetries = 5
 
-    private val client = OkHttpClient.Builder().build()
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(Duration.ofSeconds(1))
+        .writeTimeout(Duration.ofSeconds(2))
+        .readTimeout(Duration.ofSeconds(15))
+        .callTimeout(Duration.ofSeconds(20))
+        .build()
+
     private var semaphore = Semaphore(parallelRequests, true)
     private val limiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
 
@@ -58,7 +64,15 @@ class PaymentExternalSystemAdapterImpl(
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
 
-        semaphore.acquire()
+        val remainingForAcquire = (deadline - now()).coerceAtLeast(0L)
+        val acquired = if (remainingForAcquire > 0) {
+            semaphore.tryAcquire(remainingForAcquire, TimeUnit.MILLISECONDS)
+        } else false
+
+        if (!acquired) {
+            logger.warn("[$accountName] Could not acquire semaphore within deadline for payment $paymentId")
+            return
+        }
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
@@ -97,7 +111,10 @@ class PaymentExternalSystemAdapterImpl(
             }.build()
 
             try {
-                client.newCall(request).execute().use { response ->
+                val remain = (deadline - now()).coerceAtLeast(1L)
+                val call = client.newCall(request)
+                call.timeout().timeout(remain, TimeUnit.MILLISECONDS)
+                call.execute().use { response ->
                     val status = response.code
 
                     if (status == TOO_MANY_REQUESTS_429 || status == REQUEST_TIMEOUT_408 || status >= INTERNAL_SERVER_ERROR_500) {
