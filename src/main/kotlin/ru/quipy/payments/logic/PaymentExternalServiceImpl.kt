@@ -49,9 +49,11 @@ class PaymentExternalSystemAdapterImpl(
             properties.parallelRequests / (properties.averageProcessingTime.toMillis() / 1000.0)
         )).toLong()
     )
+
+    private val targetRps = 11
     private val limiter = TokenBucketRateLimiter(
         rate = safeRps.toInt(),
-        bucketMaxCapacity = safeRps.toInt(),
+        bucketMaxCapacity = targetRps,
         window = 1,
         timeUnit = TimeUnit.SECONDS
     )
@@ -74,7 +76,7 @@ class PaymentExternalSystemAdapterImpl(
 
         try {
             while (!limiter.tick()) {
-                Thread.sleep(ceil(1000.0 / safeRps).toLong())
+                Thread.sleep(ceil(1000.0 / (targetRps * 1.5)).toLong())
             }
 
             val request = Request.Builder().run {

@@ -74,6 +74,13 @@ class OrderPayer(registry: MeterRegistry) {
         )
     )
 
+    private val ingressTbOnly = TokenBucketRateLimiter(
+        rate = ingressRate,
+        bucketMaxCapacity = ingressRate * 8,
+        window = 1,
+        timeUnit = TimeUnit.SECONDS
+    )
+
     private val ingressRejectedCounter: Counter = Counter
         .builder("payments.ingress.rejected")
         .tag("code", "429")
@@ -89,8 +96,8 @@ class OrderPayer(registry: MeterRegistry) {
 
         val qSize = paymentExecutor.queue.size + 1
         val qWaitMs = ((qSize.toDouble() / ingressRate) * 1000).toLong()
-        val avgProcMs = 1000L
-        val jitterMs = 300L
+        val avgProcMs = 800L
+        val jitterMs = 150L
         val safety = avgProcMs + jitterMs
         if (qWaitMs + safety >= timeBudgetMs) {
             ingressRejectedCounter.increment()
@@ -99,7 +106,7 @@ class OrderPayer(registry: MeterRegistry) {
             throw TooManyRequestsException(backoffMs)
         }
 
-        if (!ingressLimiter.tick()) {
+        if (!ingressTbOnly.tick()) {
             ingressRejectedCounter.increment()
             val retryBase = ceil(1000.0 / ingressRate).toLong()
             val qWaitMs = ((paymentExecutor.queue.size.toDouble() / ingressRate) * 1000).toLong()
