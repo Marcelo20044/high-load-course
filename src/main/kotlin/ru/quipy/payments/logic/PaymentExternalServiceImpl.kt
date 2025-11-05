@@ -15,6 +15,7 @@ import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.common.utils.TokenBucketRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import ru.quipy.payments.metrics.PaymentMetrics
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
@@ -29,7 +30,8 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
-) : PaymentExternalSystemAdapter {
+    private val metrics: PaymentMetrics,
+    ) : PaymentExternalSystemAdapter {
 
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
@@ -103,20 +105,29 @@ class PaymentExternalSystemAdapterImpl(
                 return PaymentResult(false, "Deadline budget exceeded")
             }
 
+            val limiterWaitStart = System.currentTimeMillis()
             limiter.tickBlocking(Duration.ofMillis(backoffMs))
+            val limiterWaitTime = System.currentTimeMillis() - limiterWaitStart
+            metrics.recordLimiterWaitMs(accountName, limiterWaitTime.toDouble())
+
 
             val request = Request.Builder().run {
                 url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
                 post(emptyBody)
             }.build()
 
+            val requestStartTime = System.currentTimeMillis()
             try {
                 val remain = (deadline - now()).coerceAtLeast(1L)
+                metrics.recordDeadlineRemainingMs(accountName, remain.toDouble())
+
                 val call = client.newCall(request)
                 call.timeout().timeout(remain, TimeUnit.MILLISECONDS)
                 call.execute().use { response ->
+                    val requestLatency = System.currentTimeMillis() - requestStartTime
                     val status = response.code
 
+                    metrics.recordRequestLatency(accountName, status.toString(), requestLatency.toDouble())
                     if (status == TOO_MANY_REQUESTS_429 || status == REQUEST_TIMEOUT_408 || status >= INTERNAL_SERVER_ERROR_500) {
 
                         if (status == TOO_MANY_REQUESTS_429) {
@@ -128,6 +139,15 @@ class PaymentExternalSystemAdapterImpl(
 
                         if (now() + backoffMs < deadline) {
                             logger.warn("[$accountName] HTTP $status, retryAfter=${response.header("Retry-After")}, willBackoffMs=$backoffMs, retryCount=$retryCount for txId=$transactionId")
+                            val retryReason = when {
+                                status == TOO_MANY_REQUESTS_429 -> "http_429"
+                                status == REQUEST_TIMEOUT_408 -> "http_408"
+                                status >= INTERNAL_SERVER_ERROR_500 -> "http_5xx"
+                                else -> "http_error"
+                            }
+                            metrics.incRetry(accountName, retryReason)
+                            metrics.recordBackoffMs(accountName, retryReason, backoffMs.toDouble())
+
                             Thread.sleep(backoffMs)
                             retryCount++
                             continue
@@ -153,6 +173,9 @@ class PaymentExternalSystemAdapterImpl(
                     val isTemporary = body.message?.contains("Temporary", ignoreCase = true) == true
                     if (isTemporary) {
                         if (now() + backoffMs < deadline) {
+                            metrics.incRetry(accountName, "temporary_error")
+                            metrics.recordBackoffMs(accountName, "temporary_error", backoffMs.toDouble())
+
                             Thread.sleep(backoffMs)
                             retryCount++
                             continue
@@ -162,6 +185,9 @@ class PaymentExternalSystemAdapterImpl(
                     return PaymentResult(false, body.message)
                 }
             } catch (e: SocketTimeoutException) {
+                val requestLatency = System.currentTimeMillis() - requestStartTime
+                metrics.recordRequestLatency(accountName,"timeout", requestLatency.toDouble())
+
                 logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
 
                 if (retryCount >= maxRetries) {
@@ -169,6 +195,9 @@ class PaymentExternalSystemAdapterImpl(
                 }
 
                 if (now() + backoffMs < deadline) {
+                    metrics.incRetry(accountName, "socket_timeout")
+                    metrics.recordBackoffMs(accountName, "socket_timeout", backoffMs.toDouble())
+
                     Thread.sleep(backoffMs)
                     retryCount++
                     continue
@@ -176,6 +205,9 @@ class PaymentExternalSystemAdapterImpl(
 
                 return PaymentResult(false, "Request timeout.")
             } catch (e: Exception) {
+                val requestLatency = System.currentTimeMillis() - requestStartTime
+                metrics.recordRequestLatency(accountName,"exception", requestLatency.toDouble())
+
                 logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
                 return PaymentResult(false, e.message)
             }
