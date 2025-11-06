@@ -2,25 +2,23 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.MeterRegistry
+import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.Timer
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
-import org.eclipse.jetty.http.HttpStatus
 import org.eclipse.jetty.http.HttpStatus.INTERNAL_SERVER_ERROR_500
 import org.eclipse.jetty.http.HttpStatus.REQUEST_TIMEOUT_408
 import org.eclipse.jetty.http.HttpStatus.TOO_MANY_REQUESTS_429
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
-import ru.quipy.common.utils.TokenBucketRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
-import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
-import kotlin.math.ceil
 
 
 // Advice: always treat time as a Duration
@@ -29,6 +27,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
+    private val meterRegistry: MeterRegistry
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -44,9 +43,26 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
     private val maxRetries = 5
 
+    private val observedP85Ms = 1000L
+    private val requestTimeout = (observedP85Ms * 1.2).toLong()
+
     private val client = OkHttpClient.Builder().build()
     private var semaphore = Semaphore(parallelRequests, true)
     private val limiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+
+    private val extTimer = Timer
+        .builder("external.payment.duration")
+        .description("End-to-end payment duration")
+        .tag("accountName", properties.accountName)
+        .publishPercentiles(0.5, 0.85, 0.95, 0.99)
+        .register(meterRegistry)
+
+    private fun retriesCounter(reason: String) = Counter
+        .builder("payment.retries")
+        .description("Payment retries counter")
+        .tag("accountName", properties.accountName)
+        .tag("reason", reason)
+        .register(meterRegistry)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
 
@@ -96,9 +112,14 @@ class PaymentExternalSystemAdapterImpl(
                 post(emptyBody)
             }.build()
 
+            val startAll = now()
             try {
-                client.newCall(request).execute().use { response ->
+                val call = client.newCall(request)
+                call.timeout().timeout(requestTimeout, TimeUnit.MILLISECONDS)
+
+                call.execute().use { response ->
                     val status = response.code
+                    extTimer.record(now() - startAll, TimeUnit.MILLISECONDS)
 
                     if (status == TOO_MANY_REQUESTS_429 || status == REQUEST_TIMEOUT_408 || status >= INTERNAL_SERVER_ERROR_500) {
 
@@ -110,12 +131,18 @@ class PaymentExternalSystemAdapterImpl(
                         }
 
                         if (now() + backoffMs < deadline) {
+                            val reason = when (status) {
+                                TOO_MANY_REQUESTS_429 -> "http_429"
+                                REQUEST_TIMEOUT_408 -> "http_408"
+                                else -> "http_5xx"
+                            }
+                            retriesCounter(reason).increment()
+
                             logger.warn("[$accountName] HTTP $status, retryAfter=${response.header("Retry-After")}, willBackoffMs=$backoffMs, retryCount=$retryCount for txId=$transactionId")
                             Thread.sleep(backoffMs)
                             retryCount++
                             continue
                         }
-
                         return PaymentResult(false, "HTTP $status without time budget for retry")
                     }
 
@@ -135,6 +162,7 @@ class PaymentExternalSystemAdapterImpl(
 
                     val isTemporary = body.message?.contains("Temporary", ignoreCase = true) == true
                     if (isTemporary) {
+                        retriesCounter("temporary").increment()
                         if (now() + backoffMs < deadline) {
                             Thread.sleep(backoffMs)
                             retryCount++
@@ -144,23 +172,16 @@ class PaymentExternalSystemAdapterImpl(
 
                     return PaymentResult(false, body.message)
                 }
-            } catch (e: SocketTimeoutException) {
-                logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-
-                if (retryCount >= maxRetries) {
-                    return PaymentResult(false, "Request timeout - max retries ($maxRetries) exceeded")
-                }
-
-                if (now() + backoffMs < deadline) {
-                    Thread.sleep(backoffMs)
-                    retryCount++
-                    continue
-                }
-
-                return PaymentResult(false, "Request timeout.")
             } catch (e: Exception) {
-                logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-                return PaymentResult(false, e.message)
+                extTimer.record(now() - startAll, TimeUnit.MILLISECONDS)
+                logger.error("[$accountName] Retry: ${retryCount}: request failed", e)
+
+                if (retryCount >= maxRetries || now() + backoffMs >= deadline) {
+                    return PaymentResult(false, "Request timeout.")
+                }
+                retriesCounter("timeout").increment()
+                Thread.sleep(backoffMs)
+                retryCount++
             }
         }
 

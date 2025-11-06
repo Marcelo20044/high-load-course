@@ -1,5 +1,6 @@
 package ru.quipy.apigateway
 
+import io.prometheus.metrics.core.metrics.Summary
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
@@ -35,6 +36,17 @@ class APIController {
     data class CreateUserRequest(val name: String, val password: String)
 
     data class User(val id: UUID, val name: String)
+
+    companion object {
+        private val payOrderLatency: Summary = Summary.builder()
+            .name("http_request_latent")
+            .help("Latent time before submit (client->shop).")
+            .quantile(0.5, 0.01)
+            .quantile(0.85, 0.005)
+            .quantile(0.95, 0.005)
+            .quantile(0.99, 0.001)
+            .register()
+    }
 
     @PostMapping("/orders")
     fun createOrder(@RequestParam userId: UUID, @RequestParam price: Int): Order {
