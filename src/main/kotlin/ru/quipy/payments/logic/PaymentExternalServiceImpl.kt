@@ -6,6 +6,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.LeakingBucketRateLimiter
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.common.utils.TokenBucketRateLimiter
 import ru.quipy.core.EventSourcingService
@@ -50,12 +51,17 @@ class PaymentExternalSystemAdapterImpl(
         )).toLong()
     )
 
-    private val targetRps = 11
-    private val limiter = TokenBucketRateLimiter(
-        rate = rateLimitPerSec,
-        bucketMaxCapacity = rateLimitPerSec,
-        window = 1,
-        timeUnit = TimeUnit.SECONDS
+//    private val limiter = TokenBucketRateLimiter(
+//        rate = rateLimitPerSec,
+//        bucketMaxCapacity = rateLimitPerSec,
+//        window = 1,
+//        timeUnit = TimeUnit.SECONDS
+//    )
+
+    private val limiter = LeakingBucketRateLimiter(
+        rate = rateLimitPerSec.toLong(),
+        window = Duration.ofMillis(1000),
+        bucketSize = rateLimitPerSec
     )
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
@@ -76,7 +82,7 @@ class PaymentExternalSystemAdapterImpl(
 
         try {
             while (!limiter.tick()) {
-                Thread.sleep(ceil(1000.0 / (targetRps * 1.5)).toLong())
+                Thread.sleep(ceil(1000.0 / (rateLimitPerSec * 1.67)).toLong())
             }
 
             val request = Request.Builder().run {

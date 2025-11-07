@@ -76,7 +76,7 @@ class OrderPayer(registry: MeterRegistry) {
 
     private val ingressTbOnly = TokenBucketRateLimiter(
         rate = ingressRate,
-        bucketMaxCapacity = ingressRate * 8,
+        bucketMaxCapacity = 250,
         window = 1,
         timeUnit = TimeUnit.SECONDS
     )
