@@ -19,6 +19,7 @@ import io.micrometer.core.instrument.MeterRegistry
 import ru.quipy.common.utils.CompositeRateLimiter
 import ru.quipy.common.utils.LeakingBucketRateLimiter
 import ru.quipy.common.utils.TokenBucketRateLimiter
+import java.util.concurrent.RejectedExecutionException
 import kotlin.math.ceil
 import kotlin.math.min
 
@@ -36,13 +37,13 @@ class OrderPayer(registry: MeterRegistry) {
     private lateinit var paymentService: PaymentService
 
     private val paymentExecutor = ThreadPoolExecutor(
-        50,
-        50,
+        32,
+        64,
         0L,
         TimeUnit.MILLISECONDS,
         LinkedBlockingQueue(256),
         NamedThreadFactory("payment-submission-executor"),
-        CallerBlockingRejectedExecutionHandler()
+        ThreadPoolExecutor.AbortPolicy()
     )
 
     private val acceptedCounter: Counter = Counter
@@ -51,8 +52,8 @@ class OrderPayer(registry: MeterRegistry) {
 
     private val rejectedExpired = registry.counter("payments.rejected", "code", "429", "reason", "expired")
     private val rejectedDeadline = registry.counter("payments.rejected", "code", "429", "reason", "deadline_budget")
-    private val rejectedLimiter  = registry.counter("payments.rejected", "code", "429", "reason", "limiter_throttle")
-    private val rejectedQueue    = registry.counter("payments.rejected", "code", "429", "reason", "queue_overflow")
+    private val rejectedLimiter = registry.counter("payments.rejected", "code", "429", "reason", "limiter_throttle")
+    private val rejectedQueue = registry.counter("payments.rejected", "code", "429", "reason", "queue_overflow")
 
 
     init {
@@ -61,18 +62,12 @@ class OrderPayer(registry: MeterRegistry) {
             .register(registry)
     }
 
-    private val ingressRate = 10
-    private val ingressLimiter = CompositeRateLimiter(
-        TokenBucketRateLimiter(
-            rate = ingressRate,
-            bucketMaxCapacity = ingressRate * 4,
-            window = 1,
-            timeUnit = TimeUnit.SECONDS
-        ), LeakingBucketRateLimiter(
-            rate = ingressRate.toLong(),
-            window = Duration.ofSeconds(1),
-            bucketSize = 16
-        )
+    private val ingressRate = 100
+    private val limiter = TokenBucketRateLimiter(
+        rate = ingressRate,
+        bucketMaxCapacity = ingressRate * 10,
+        window = 1,
+        timeUnit = TimeUnit.SECONDS
     )
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
@@ -95,7 +90,7 @@ class OrderPayer(registry: MeterRegistry) {
             throw TooManyRequestsException(backoffMs)
         }
 
-        if (!ingressLimiter.tick()) {
+        if (!limiter.tick()) {
             rejectedLimiter.increment()
             val retryBase = ceil(1000.0 / ingressRate).toLong()
             val qWaitMs = ((paymentExecutor.queue.size.toDouble() / ingressRate) * 1000).toLong()
@@ -111,7 +106,7 @@ class OrderPayer(registry: MeterRegistry) {
 
         acceptedCounter.increment()
 
-        paymentExecutor.submit {
+        val task = ExecutorTask {
             val createdEvent = paymentESService.create {
                 it.create(
                     paymentId,
@@ -123,6 +118,23 @@ class OrderPayer(registry: MeterRegistry) {
 
             paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
         }
+
+        try {
+            paymentExecutor.submit(task)
+        } catch (ex: RejectedExecutionException) {
+            rejectedQueue.increment()
+            val qSizeAfterReject = paymentExecutor.queue.size
+            val backoffMs = (5 * ceil(1000.0 / ingressRate)).toLong()
+            logger.error(
+                "paymentExecutor rejected paymentId={}, queueSize={}, activeThreads={}",
+                paymentId,
+                qSizeAfterReject,
+                paymentExecutor.activeCount,
+                ex
+            )
+            throw TooManyRequestsException(backoffMs)
+        }
+
         return createdAt
     }
 }
