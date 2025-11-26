@@ -37,11 +37,11 @@ class OrderPayer(registry: MeterRegistry) {
     private lateinit var paymentService: PaymentService
 
     private val paymentExecutor = ThreadPoolExecutor(
-        128,
-        256,
+        32,
+        64,
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(10000),
+        LinkedBlockingQueue(5000),
         NamedThreadFactory("payment-submission-executor"),
         ThreadPoolExecutor.AbortPolicy()
     )
@@ -62,7 +62,7 @@ class OrderPayer(registry: MeterRegistry) {
             .register(registry)
     }
 
-    private val ingressRate = 100
+    private val ingressRate = 1000
     private val limiter = TokenBucketRateLimiter(
         rate = ingressRate,
         bucketMaxCapacity = ingressRate * 10,
