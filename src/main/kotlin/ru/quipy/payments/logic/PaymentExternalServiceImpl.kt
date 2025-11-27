@@ -41,12 +41,27 @@ class PaymentExternalSystemAdapterImpl(
         val mapper = ObjectMapper().registerKotlinModule()
     }
 
+    private val esExecutor: ExecutorService = Executors.newFixedThreadPool(
+        8,
+        NamedThreadFactory("payment-es-updates-${properties.accountName}")
+    )
+
+    private fun submitEsUpdate(block: () -> Unit) {
+        esExecutor.submit {
+            try {
+                block()
+            } catch (e: Exception) {
+                logger.error("[${properties.accountName}] ES update failed", e)
+            }
+        }
+    }
+
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
-    private val maxRetries = 5
+    private val maxRetries = 10
 
     private val callTimeoutMs = requestAverageProcessingTime.toMillis() * 2L
     private val connectTimeoutMs = 5_000L
@@ -102,27 +117,41 @@ class PaymentExternalSystemAdapterImpl(
 
         val transactionId = UUID.randomUUID()
 
-        paymentESService.update(paymentId) {
-            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+        submitEsUpdate {
+            paymentESService.update(paymentId) {
+                it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+            }
         }
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
         executePaymentWithRetriesAsync(paymentId, amount, transactionId, deadline)
             .whenComplete { result, throwable ->
-                try {
-                    if (throwable != null) {
-                        logger.error("[$accountName] Payment failed for payment $paymentId", throwable)
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(false, now(), transactionId, reason = throwable.message ?: "Exception")
+                submitEsUpdate {
+                    try {
+                        if (throwable != null) {
+                            logger.error("[${properties.accountName}] Payment failed for payment $paymentId", throwable)
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(
+                                    success = false,
+                                    processedAt = now(),
+                                    transactionId = transactionId,
+                                    reason = throwable.message ?: "Exception"
+                                )
+                            }
+                        } else {
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(
+                                    success = result.success,
+                                    processedAt = now(),
+                                    transactionId = transactionId,
+                                    reason = result.reason
+                                )
+                            }
                         }
-                    } else {
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(result.success, now(), transactionId, reason = result.reason)
-                        }
+                    } catch (e: Exception) {
+                        logger.error("[${properties.accountName}] Error updating payment state for $paymentId", e)
                     }
-                } catch (e: Exception) {
-                    logger.error("[$accountName] Error updating payment state for $paymentId", e)
                 }
             }
     }
@@ -154,7 +183,6 @@ class PaymentExternalSystemAdapterImpl(
             return CompletableFuture.completedFuture(PaymentResult(false, "Deadline budget exceeded"))
         }
 
-        // Rate limiting
         if (!limiter.tick()) {
             val waitTime = (1000.0 / rateLimitPerSec).toLong().coerceAtMost(100L)
             if (now() + waitTime >= deadline) {
@@ -179,7 +207,6 @@ class PaymentExternalSystemAdapterImpl(
             return future
         }
 
-        // Parallelism limiting
         if (!semaphore.tryAcquire()) {
             val retryDelay = 50L
             if (now() + retryDelay >= deadline) {
@@ -324,7 +351,7 @@ class PaymentExternalSystemAdapterImpl(
                 releaseSlot()
                 recordDuration(startAll)
 
-                logger.error("[$accountName] Retry: $retryCount: request failed for txId=$transactionId", ex)
+                logger.warn("[$accountName] Retry: $retryCount: request failed for txId=$transactionId", ex)
 
                 if (retryCount >= maxRetries || now() + backoffMs >= deadline) {
                     future.complete(PaymentResult(false, "Request timeout: ${ex.message}"))
