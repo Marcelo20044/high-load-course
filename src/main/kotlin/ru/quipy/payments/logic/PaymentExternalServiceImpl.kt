@@ -23,6 +23,7 @@ import java.util.concurrent.*
 import java.util.concurrent.atomic.AtomicInteger
 import org.apache.hc.client5.http.async.methods.SimpleHttpResponse
 import org.apache.hc.client5.http.async.methods.SimpleRequestBuilder
+import org.apache.hc.client5.http.config.ConnectionConfig
 import org.apache.hc.core5.http.ContentType
 import org.apache.hc.client5.http.config.RequestConfig
 import org.apache.hc.core5.util.Timeout
@@ -53,13 +54,17 @@ class PaymentExternalSystemAdapterImpl(
     private val readTimeoutMs = callTimeoutMs
 
     private val requestConfig: RequestConfig = RequestConfig.custom()
-        .setConnectTimeout(Timeout.ofMilliseconds(connectTimeoutMs))
         .setConnectionRequestTimeout(Timeout.ofMilliseconds(connectTimeoutMs))
         .setResponseTimeout(Timeout.ofMilliseconds(readTimeoutMs))
         .build()
 
+    private val connectionConfig: ConnectionConfig = ConnectionConfig.custom()
+        .setConnectTimeout(Timeout.ofMilliseconds(connectTimeoutMs))
+        .build()
+
     private val client: CloseableHttpAsyncClient =
         HttpAsyncClients.customHttp2()
+            .setDefaultConnectionConfig(connectionConfig)
             .setDefaultRequestConfig(requestConfig)
             .build()
 
