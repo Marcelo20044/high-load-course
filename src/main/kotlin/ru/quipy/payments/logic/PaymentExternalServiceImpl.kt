@@ -192,7 +192,10 @@ class PaymentExternalSystemAdapterImpl(
 
 
         if (!limiter.tick()) {
-            val waitTime = (1000.0 / rateLimitPerSec).toLong().coerceAtMost(100L)
+            // Гарантируем ненулевую задержку между попытками при превышении лимита
+            val waitTime = (1000.0 / rateLimitPerSec)
+                .toLong()
+                .coerceIn(1L, 100L)
             if (now() + waitTime >= deadline) {
                 return CompletableFuture.completedFuture(
                     PaymentResult(false, "Rate limit exceeded, no time budget for retry")
