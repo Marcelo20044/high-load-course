@@ -69,7 +69,7 @@ class OrderPayer(registry: MeterRegistry) {
             .register(registry)
     }
 
-    private val ingressRate = 5000
+    private val ingressRate = 4000
     private val limiter = TokenBucketRateLimiter(
         rate = ingressRate,
         bucketMaxCapacity = ingressRate * 2,
@@ -83,7 +83,7 @@ class OrderPayer(registry: MeterRegistry) {
                 CoroutineName("payment-scope")
     )
 
-    private val inFlightSemaphore = Semaphore(5000)
+    private val inFlightSemaphore = Semaphore(2200)
 
 
     suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
@@ -120,21 +120,26 @@ class OrderPayer(registry: MeterRegistry) {
                 return@launch
             }
 
-            // ES.create запускаем в отдельной корутине — не блокирует payment-путь
-            launch(Dispatchers.IO) {
-                try {
-                    val createdEvent = paymentESService.create {
-                        it.create(paymentId, orderId, amount)
-                    }
-                    logger.trace("Payment {} for order {} created.", createdEvent.paymentId, orderId)
-                } catch (e: Exception) {
-                    logger.error("ES create failed for payment $paymentId", e)
+            try {
+                paymentESService.create {
+                    it.create(paymentId, orderId, amount)
                 }
+            } catch (e: Exception) {
+                logger.error("ES create failed for payment $paymentId", e)
+                inFlightSemaphore.release()
+                return@launch
+            }
+
+            val remainingAfterCreate = deadline - now()
+            if (remainingAfterCreate <= 0L) {
+                rejectedDeadline.increment()
+                inFlightSemaphore.release()
+                return@launch
             }
 
             // Сразу идём к платежу, пока deadline ещё актуален
             try {
-                withTimeout(remaining - 50) { // -50ms запас на сеть
+                withTimeout((remainingAfterCreate - 30).coerceAtLeast(1)) {
                     paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
                 }
             } catch (e: TimeoutCancellationException) {

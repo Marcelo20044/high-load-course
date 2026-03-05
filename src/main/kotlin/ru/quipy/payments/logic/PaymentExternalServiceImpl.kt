@@ -47,7 +47,7 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
-    private val maxRetries = 10
+    private val maxRetries = 2
 
     private val callTimeoutMs = requestAverageProcessingTime.toMillis() * 2L
     private val connectTimeoutMs = 2_000L
@@ -184,18 +184,20 @@ class PaymentExternalSystemAdapterImpl(
             )
         }
 
-        if (now() + backoffMs > deadline) {
-            return CompletableFuture.completedFuture(
-                PaymentResult(false, "Deadline budget exceeded")
-            )
+        val remaining = deadline - now()
+        if (remaining <= 0L) {
+            return CompletableFuture.completedFuture(PaymentResult(false, "Deadline exceeded"))
+        }
+        if (backoffMs >= remaining - 20) {
+            return CompletableFuture.completedFuture(PaymentResult(false, "Deadline budget exceeded"))
         }
 
 
         if (!limiter.tick()) {
-            val waitTime = (1000.0 / rateLimitPerSec).toLong().coerceAtMost(100L)
+            val waitTime = 20L
             if (now() + waitTime >= deadline) {
                 return CompletableFuture.completedFuture(
-                    PaymentResult(false, "Rate limit exceeded, no time budget for retry")
+                    PaymentResult(false, "Rate limit exceeded, no time budget")
                 )
             }
 
@@ -215,10 +217,10 @@ class PaymentExternalSystemAdapterImpl(
 
 
         if (!semaphore.tryAcquire()) {
-            val retryDelay = 50L
-            if (now() + retryDelay >= deadline) {
+            val retryDelay = 30L
+            if (retryCount >= 1 || now() + retryDelay >= deadline) {
                 return CompletableFuture.completedFuture(
-                    PaymentResult(false, "Parallel request limit exceeded, no time budget for retry")
+                    PaymentResult(false, "Parallel limit exceeded")
                 )
             }
 
