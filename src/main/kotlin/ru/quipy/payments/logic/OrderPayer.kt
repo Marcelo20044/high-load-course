@@ -15,8 +15,18 @@ import java.util.concurrent.TimeUnit
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.Gauge
 import io.micrometer.core.instrument.MeterRegistry
+import kotlinx.coroutines.CoroutineName
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import ru.quipy.common.utils.TokenBucketRateLimiter
 import java.util.concurrent.RejectedExecutionException
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.math.ceil
 import kotlin.math.min
 
@@ -59,71 +69,83 @@ class OrderPayer(registry: MeterRegistry) {
             .register(registry)
     }
 
-    private val ingressRate = 1000
+    private val ingressRate = 5000
     private val limiter = TokenBucketRateLimiter(
         rate = ingressRate,
-        bucketMaxCapacity = ingressRate * 10,
+        bucketMaxCapacity = ingressRate * 2,
         window = 1,
         timeUnit = TimeUnit.SECONDS
     )
 
-    fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
+    private val paymentScope = CoroutineScope(
+        Dispatchers.IO.limitedParallelism(256) +
+                SupervisorJob() +
+                CoroutineName("payment-scope")
+    )
+
+    private val inFlightSemaphore = Semaphore(5000)
+
+
+    suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = now()
         val timeBudgetMs = deadline - createdAt
+
         if (timeBudgetMs <= 0L) {
             rejectedExpired.increment()
             throw TooManyRequestsException(100)
         }
 
-        val qSize = paymentExecutor.queue.size + 1
-        val qWaitMs = ((qSize.toDouble() / ingressRate) * 1000).toLong()
-        val avgProcMs = 1000L
-        val jitterMs = 300L
-        val safety = avgProcMs + jitterMs
-        if (qWaitMs + safety >= timeBudgetMs) {
-            rejectedDeadline.increment()
-            val retryBase = ceil(1000.0 / ingressRate).toLong()
-            val backoffMs = (retryBase + min(qWaitMs, 2000)).coerceIn(50, 3000)
-            throw TooManyRequestsException(backoffMs)
-        }
-
         if (!limiter.tick()) {
             rejectedLimiter.increment()
-            val retryBase = ceil(1000.0 / ingressRate).toLong()
-            val qWaitMs = ((paymentExecutor.queue.size.toDouble() / ingressRate) * 1000).toLong()
-            val backoffMs = (retryBase + min(qWaitMs, 2000)).coerceIn(50, 3000)
-            throw TooManyRequestsException(backoffMs)
+            throw TooManyRequestsException(50)
+        }
+
+        // tryAcquire() — не блокирует поток: если слотов нет, сразу отдаём 429
+        if (!inFlightSemaphore.tryAcquire()) {
+            rejectedQueue.increment()
+            throw TooManyRequestsException(100)
         }
 
         acceptedCounter.increment()
 
-        val task = ExecutorTask {
-            val createdEvent = paymentESService.create {
-                it.create(
-                    paymentId,
-                    orderId,
-                    amount
-                )
+        // launch: fire-and-forget внутри скоупа.
+        // SupervisorJob гарантирует, что падение одной корутины
+        // не убивает весь скоуп и остальные платежи.
+        paymentScope.launch {
+            // Сначала проверяем deadline ДО любых IO-операций
+            val remaining = deadline - now()
+            if (remaining <= 0L) {
+                rejectedDeadline.increment()
+                inFlightSemaphore.release()
+                return@launch
             }
-            logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
 
-            paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
-        }
+            // ES.create запускаем в отдельной корутине — не блокирует payment-путь
+            launch(Dispatchers.IO) {
+                try {
+                    val createdEvent = paymentESService.create {
+                        it.create(paymentId, orderId, amount)
+                    }
+                    logger.trace("Payment {} for order {} created.", createdEvent.paymentId, orderId)
+                } catch (e: Exception) {
+                    logger.error("ES create failed for payment $paymentId", e)
+                }
+            }
 
-        try {
-            paymentExecutor.submit(task)
-        } catch (ex: RejectedExecutionException) {
-            rejectedQueue.increment()
-            val qSizeAfterReject = paymentExecutor.queue.size
-            val backoffMs = (5 * ceil(1000.0 / ingressRate)).toLong()
-            logger.error(
-                "paymentExecutor rejected paymentId={}, queueSize={}, activeThreads={}",
-                paymentId,
-                qSizeAfterReject,
-                paymentExecutor.activeCount,
-                ex
-            )
-            throw TooManyRequestsException(backoffMs)
+            // Сразу идём к платежу, пока deadline ещё актуален
+            try {
+                withTimeout(remaining - 50) { // -50ms запас на сеть
+                    paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+                }
+            } catch (e: TimeoutCancellationException) {
+                logger.warn("Payment $paymentId deadline exceeded during HTTP call")
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.error("Payment $paymentId failed", e)
+            } finally {
+                inFlightSemaphore.release()
+            }
         }
 
         return createdAt

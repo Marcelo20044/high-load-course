@@ -49,13 +49,12 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
     private val maxRetries = 10
 
-    private val callTimeoutMs = requestAverageProcessingTime.toMillis() * 2L
+//    private val callTimeoutMs = requestAverageProcessingTime.toMillis() * 2L
     private val connectTimeoutMs = 5_000L
-    private val readTimeoutMs = callTimeoutMs
+//    private val readTimeoutMs = callTimeoutMs
 
     private val requestConfig: RequestConfig = RequestConfig.custom()
         .setConnectionRequestTimeout(Timeout.ofMilliseconds(connectTimeoutMs))
-        .setResponseTimeout(Timeout.ofMilliseconds(readTimeoutMs))
         .build()
 
     private val connectionConfig: ConnectionConfig = ConnectionConfig.custom()
@@ -68,7 +67,10 @@ class PaymentExternalSystemAdapterImpl(
             .setDefaultRequestConfig(requestConfig)
             .build()
 
-    private val semaphore = Semaphore(parallelRequests, true)
+    private val optimalParallelism = (rateLimitPerSec * requestAverageProcessingTime.toMillis() / 1000.0 * 4)
+        .coerceIn(50.0, parallelRequests.toDouble()).toInt()
+
+    private val semaphore = Semaphore(optimalParallelism, true)
     private val limiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
 
     private val scheduledExecutor = ScheduledThreadPoolExecutor(
@@ -98,12 +100,18 @@ class PaymentExternalSystemAdapterImpl(
         .publishPercentiles(0.5, 0.85, 0.95, 0.99)
         .register(meterRegistry)
 
-    private fun retriesCounter(reason: String) = Counter
-        .builder("payment.retries")
-        .description("Payment retries counter")
-        .tag("accountName", properties.accountName)
-        .tag("reason", reason)
-        .register(meterRegistry)
+    private val retriesCounters = mapOf(
+        "http_429" to Counter.builder("payment.retries").tag("reason", "http_429")
+            .tag("accountName", accountName).register(meterRegistry),
+        "http_408" to Counter.builder("payment.retries").tag("reason", "http_408")
+            .tag("accountName", accountName).register(meterRegistry),
+        "http_5xx" to Counter.builder("payment.retries").tag("reason", "http_5xx")
+            .tag("accountName", accountName).register(meterRegistry),
+        "temporary" to Counter.builder("payment.retries").tag("reason", "temporary")
+            .tag("accountName", accountName).register(meterRegistry),
+        "timeout" to Counter.builder("payment.retries").tag("reason", "timeout")
+            .tag("accountName", accountName).register(meterRegistry),
+    )
 
     private val activeRequests = AtomicInteger(0)
 
@@ -249,8 +257,17 @@ class PaymentExternalSystemAdapterImpl(
                     "&amount=$amount"
 
 
+        val timeoutMs = (deadline - now() - 50L)
+            .coerceIn(200L, 5000L)
+
+        val perRequestConfig = RequestConfig.custom()
+            .setConnectionRequestTimeout(Timeout.ofMilliseconds(connectTimeoutMs))
+            .setResponseTimeout(Timeout.ofMilliseconds(timeoutMs))
+            .build()
+
         val request = SimpleRequestBuilder.post(url)
             .setBody("", ContentType.TEXT_PLAIN)
+            .setRequestConfig(perRequestConfig)
             .build()
 
         val startAll = now()
@@ -275,7 +292,7 @@ class PaymentExternalSystemAdapterImpl(
 
                             if (!ra.isNullOrBlank()) {
                                 ra.toLongOrNull()?.let {
-                                    newBackoffMs = (it * 1000).coerceAtLeast(1000L)
+                                    newBackoffMs = it.coerceIn(50L, 5000L)
                                 }
                             }
                         }
@@ -286,7 +303,7 @@ class PaymentExternalSystemAdapterImpl(
                                 REQUEST_TIMEOUT_408 -> "http_408"
                                 else -> "http_5xx"
                             }
-                            retriesCounter(reason).increment()
+                            retriesCounters[reason]?.increment()
 
                             logger.warn(
                                 "[$accountName] HTTP $status, retryAfter=${
@@ -343,7 +360,7 @@ class PaymentExternalSystemAdapterImpl(
                     val isTemporary =
                         body.message?.contains("Temporary", ignoreCase = true) == true
                     if (isTemporary && now() + backoffMs < deadline) {
-                        retriesCounter("temporary").increment()
+                        retriesCounters["temporary"]?.increment()
                         val nextBackoffMs = (backoffMs * 1.5).toLong().coerceAtMost(5000L)
 
                         scheduleRetry(
@@ -376,7 +393,7 @@ class PaymentExternalSystemAdapterImpl(
                     return
                 }
 
-                retriesCounter("timeout").increment()
+                retriesCounters["timeout"]?.increment()
                 val nextBackoffMs = (backoffMs * 1.5).toLong().coerceAtMost(5000L)
 
                 scheduleRetry(
