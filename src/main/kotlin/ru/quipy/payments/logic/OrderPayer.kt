@@ -78,7 +78,7 @@ class OrderPayer(registry: MeterRegistry) {
     )
 
     private val paymentScope = CoroutineScope(
-        Dispatchers.IO.limitedParallelism(256) +
+        Dispatchers.IO +
                 SupervisorJob() +
                 CoroutineName("payment-scope")
     )
@@ -100,7 +100,6 @@ class OrderPayer(registry: MeterRegistry) {
             throw TooManyRequestsException(50)
         }
 
-        // tryAcquire() — не блокирует поток: если слотов нет, сразу отдаём 429
         if (!inFlightSemaphore.tryAcquire()) {
             rejectedQueue.increment()
             throw TooManyRequestsException(100)
@@ -108,37 +107,19 @@ class OrderPayer(registry: MeterRegistry) {
 
         acceptedCounter.increment()
 
-        // launch: fire-and-forget внутри скоупа.
-        // SupervisorJob гарантирует, что падение одной корутины
-        // не убивает весь скоуп и остальные платежи.
         paymentScope.launch {
-            // Сначала проверяем deadline ДО любых IO-операций
-            val remaining = deadline - now()
-            if (remaining <= 0L) {
-                rejectedDeadline.increment()
-                inFlightSemaphore.release()
-                return@launch
-            }
-
-            // ES.create запускаем в отдельной корутине — не блокирует payment-путь
-            launch(Dispatchers.IO) {
-                try {
-                    val createdEvent = paymentESService.create {
-                        it.create(paymentId, orderId, amount)
-                    }
-                    logger.trace("Payment {} for order {} created.", createdEvent.paymentId, orderId)
-                } catch (e: Exception) {
-                    logger.error("ES create failed for payment $paymentId", e)
-                }
-            }
-
-            // Сразу идём к платежу, пока deadline ещё актуален
             try {
-                withTimeout(remaining - 50) { // -50ms запас на сеть
-                    paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+                launch(Dispatchers.IO) {
+                    try {
+                        paymentESService.create {
+                            it.create(paymentId, orderId, amount)
+                        }
+                    } catch (e: Exception) {
+                        logger.debug("ES create failed for payment $paymentId: ${e.message}")
+                    }
                 }
-            } catch (e: TimeoutCancellationException) {
-                logger.warn("Payment $paymentId deadline exceeded during HTTP call")
+
+                paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
