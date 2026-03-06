@@ -59,7 +59,7 @@ class OrderPayer(registry: MeterRegistry) {
             .register(registry)
     }
 
-    private val ingressRate = 1000
+    private val ingressRate = 1100
     private val limiter = TokenBucketRateLimiter(
         rate = ingressRate,
         bucketMaxCapacity = ingressRate * 10,
