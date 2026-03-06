@@ -11,7 +11,7 @@ Content-Type: application/json
   "ratePerSecond": 4000,
   "testCount": 1500000,
   "processingTimeMillis": 1000
-}а
+}
 
 ### Stop running test to save credits
 # @timeout 120

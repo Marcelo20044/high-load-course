@@ -37,8 +37,6 @@ class PaymentSystemImpl(
         }
         val account = enabled[(counter.getAndIncrement() % enabled.size).toInt()]
 
-        // performPaymentAsync стал suspend — не блокирует поток во время HTTP-вызова.
-        // Deadline передаём внутрь: там можно использовать withTimeout(deadline - now())
         account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
     }
 }

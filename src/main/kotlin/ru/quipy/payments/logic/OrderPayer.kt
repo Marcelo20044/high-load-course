@@ -100,7 +100,6 @@ class OrderPayer(registry: MeterRegistry) {
             throw TooManyRequestsException(50)
         }
 
-        // tryAcquire() — не блокирует поток: если слотов нет, сразу отдаём 429
         if (!inFlightSemaphore.tryAcquire()) {
             rejectedQueue.increment()
             throw TooManyRequestsException(100)
@@ -108,11 +107,7 @@ class OrderPayer(registry: MeterRegistry) {
 
         acceptedCounter.increment()
 
-        // launch: fire-and-forget внутри скоупа.
-        // SupervisorJob гарантирует, что падение одной корутины
-        // не убивает весь скоуп и остальные платежи.
         paymentScope.launch {
-            // Сначала проверяем deadline ДО любых IO-операций
             val remaining = deadline - now()
             if (remaining <= 0L) {
                 rejectedDeadline.increment()
@@ -120,7 +115,6 @@ class OrderPayer(registry: MeterRegistry) {
                 return@launch
             }
 
-            // ES.create запускаем в отдельной корутине — не блокирует payment-путь
             launch(Dispatchers.IO) {
                 try {
                     val createdEvent = paymentESService.create {
@@ -132,9 +126,8 @@ class OrderPayer(registry: MeterRegistry) {
                 }
             }
 
-            // Сразу идём к платежу, пока deadline ещё актуален
             try {
-                withTimeout(remaining - 50) { // -50ms запас на сеть
+                withTimeout(remaining - 50) {
                     paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
                 }
             } catch (e: TimeoutCancellationException) {
