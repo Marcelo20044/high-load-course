@@ -120,15 +120,16 @@ class OrderPayer(registry: MeterRegistry) {
                 return@launch
             }
 
-            try {
-                paymentESService.create {
-                    it.create(paymentId, orderId, amount)
+            // ES.create запускаем в отдельной корутине — не блокирует payment-путь
+            launch(Dispatchers.IO) {
+                try {
+                    val createdEvent = paymentESService.create {
+                        it.create(paymentId, orderId, amount)
+                    }
+                    logger.trace("Payment {} for order {} created.", createdEvent.paymentId, orderId)
+                } catch (e: Exception) {
+                    logger.error("ES create failed for payment $paymentId", e)
                 }
-            } catch (e: Exception) {
-                // если create уже был (повтор запроса / идемпотентность) — можно обработать отдельно
-                logger.error("ES create failed for payment $paymentId", e)
-                inFlightSemaphore.release()
-                throw e
             }
 
             // Сразу идём к платежу, пока deadline ещё актуален

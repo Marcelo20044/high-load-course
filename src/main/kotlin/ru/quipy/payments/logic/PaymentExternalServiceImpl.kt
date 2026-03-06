@@ -47,7 +47,7 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
-    private val maxRetries = 10
+    private val maxRetries = 5
 
     private val callTimeoutMs = requestAverageProcessingTime.toMillis() * 2L
     private val connectTimeoutMs = 2_000L
