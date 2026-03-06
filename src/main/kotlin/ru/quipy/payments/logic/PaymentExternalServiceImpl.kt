@@ -28,7 +28,6 @@ import org.apache.hc.core5.http.ContentType
 import org.apache.hc.client5.http.config.RequestConfig
 import org.apache.hc.core5.util.Timeout
 
-
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
@@ -50,7 +49,7 @@ class PaymentExternalSystemAdapterImpl(
     private val maxRetries = 10
 
     private val callTimeoutMs = requestAverageProcessingTime.toMillis() * 2L
-    private val connectTimeoutMs = 5_000L
+    private val connectTimeoutMs = 2_000L
     private val readTimeoutMs = callTimeoutMs
 
     private val requestConfig: RequestConfig = RequestConfig.custom()
@@ -190,12 +189,8 @@ class PaymentExternalSystemAdapterImpl(
             )
         }
 
-
         if (!limiter.tick()) {
-            // Гарантируем ненулевую задержку между попытками при превышении лимита
-            val waitTime = (1000.0 / rateLimitPerSec)
-                .toLong()
-                .coerceIn(1L, 100L)
+            val waitTime = (1000.0 / rateLimitPerSec).toLong().coerceAtMost(100L)
             if (now() + waitTime >= deadline) {
                 return CompletableFuture.completedFuture(
                     PaymentResult(false, "Rate limit exceeded, no time budget for retry")
@@ -215,7 +210,6 @@ class PaymentExternalSystemAdapterImpl(
             )
             return future
         }
-
 
         if (!semaphore.tryAcquire()) {
             val retryDelay = 50L
@@ -251,7 +245,6 @@ class PaymentExternalSystemAdapterImpl(
                     "&paymentId=$paymentId" +
                     "&amount=$amount"
 
-
         val request = SimpleRequestBuilder.post(url)
             .setBody("", ContentType.TEXT_PLAIN)
             .build()
@@ -278,7 +271,7 @@ class PaymentExternalSystemAdapterImpl(
 
                             if (!ra.isNullOrBlank()) {
                                 ra.toLongOrNull()?.let {
-                                    newBackoffMs = (it * 1000).coerceAtLeast(1000L)
+                                    newBackoffMs = it.coerceIn(50L, 5000L)
                                 }
                             }
                         }
