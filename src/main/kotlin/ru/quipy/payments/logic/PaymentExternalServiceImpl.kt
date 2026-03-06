@@ -47,7 +47,7 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
-    private val maxRetries = 2
+    private val maxRetries = 10
 
     private val callTimeoutMs = requestAverageProcessingTime.toMillis() * 2L
     private val connectTimeoutMs = 2_000L
@@ -116,7 +116,7 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        logger.debug("[{}] Submitting payment request for payment {}", accountName, paymentId)
+        logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
 
@@ -126,7 +126,7 @@ class PaymentExternalSystemAdapterImpl(
             }
         }
 
-        logger.debug("[{}] Submit: {} , txId: {}", accountName, paymentId, transactionId)
+        logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
         executePaymentWithRetriesAsync(paymentId, amount, transactionId, deadline)
             .whenComplete { result, throwable ->
@@ -184,20 +184,18 @@ class PaymentExternalSystemAdapterImpl(
             )
         }
 
-        val remaining = deadline - now()
-        if (remaining <= 0L) {
-            return CompletableFuture.completedFuture(PaymentResult(false, "Deadline exceeded"))
-        }
-        if (backoffMs >= remaining - 20) {
-            return CompletableFuture.completedFuture(PaymentResult(false, "Deadline budget exceeded"))
+        if (now() + backoffMs > deadline) {
+            return CompletableFuture.completedFuture(
+                PaymentResult(false, "Deadline budget exceeded")
+            )
         }
 
 
         if (!limiter.tick()) {
-            val waitTime = 20L
+            val waitTime = (1000.0 / rateLimitPerSec).toLong().coerceAtMost(100L)
             if (now() + waitTime >= deadline) {
                 return CompletableFuture.completedFuture(
-                    PaymentResult(false, "Rate limit exceeded, no time budget")
+                    PaymentResult(false, "Rate limit exceeded, no time budget for retry")
                 )
             }
 
@@ -217,10 +215,10 @@ class PaymentExternalSystemAdapterImpl(
 
 
         if (!semaphore.tryAcquire()) {
-            val retryDelay = 30L
-            if (retryCount >= 1 || now() + retryDelay >= deadline) {
+            val retryDelay = 50L
+            if (now() + retryDelay >= deadline) {
                 return CompletableFuture.completedFuture(
-                    PaymentResult(false, "Parallel limit exceeded")
+                    PaymentResult(false, "Parallel request limit exceeded, no time budget for retry")
                 )
             }
 
@@ -332,13 +330,9 @@ class PaymentExternalSystemAdapterImpl(
                         )
                     }
 
-                    logger.debug(
-                        "[{}] Payment processed for txId: {}, payment: {}, succeeded: {}, message: {}",
-                        accountName,
-                        transactionId,
-                        paymentId,
-                        body.result,
-                        body.message
+                    logger.warn(
+                        "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, " +
+                                "succeeded: ${body.result}, message: ${body.message}"
                     )
 
                     if (body.result) {
@@ -375,7 +369,7 @@ class PaymentExternalSystemAdapterImpl(
                 releaseSlot()
                 recordDuration(startAll)
 
-                logger.debug("[{}] Retry: {}: request failed for txId={}", accountName, retryCount, transactionId, ex)
+                logger.warn("[$accountName] Retry: $retryCount: request failed for txId=$transactionId", ex)
 
                 if (retryCount >= maxRetries || now() + backoffMs >= deadline) {
                     future.complete(PaymentResult(false, "Request timeout: ${ex.message}"))

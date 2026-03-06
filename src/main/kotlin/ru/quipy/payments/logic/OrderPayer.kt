@@ -69,7 +69,7 @@ class OrderPayer(registry: MeterRegistry) {
             .register(registry)
     }
 
-    private val ingressRate = 5500
+    private val ingressRate = 5000
     private val limiter = TokenBucketRateLimiter(
         rate = ingressRate,
         bucketMaxCapacity = ingressRate * 2,
@@ -78,12 +78,12 @@ class OrderPayer(registry: MeterRegistry) {
     )
 
     private val paymentScope = CoroutineScope(
-        Dispatchers.IO +
+        Dispatchers.IO.limitedParallelism(256) +
                 SupervisorJob() +
                 CoroutineName("payment-scope")
     )
 
-    private val inFlightSemaphore = Semaphore(8000)
+    private val inFlightSemaphore = Semaphore(5000)
 
 
     suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
@@ -125,21 +125,19 @@ class OrderPayer(registry: MeterRegistry) {
                     it.create(paymentId, orderId, amount)
                 }
             } catch (e: Exception) {
+                // если create уже был (повтор запроса / идемпотентность) — можно обработать отдельно
                 logger.error("ES create failed for payment $paymentId", e)
                 inFlightSemaphore.release()
-                return@launch
-            }
-
-            val remainingAfterCreate = deadline - now()
-            if (remainingAfterCreate <= 0L) {
-                rejectedDeadline.increment()
-                inFlightSemaphore.release()
-                return@launch
+                throw e
             }
 
             // Сразу идём к платежу, пока deadline ещё актуален
             try {
-                paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+                withTimeout(remaining - 50) { // -50ms запас на сеть
+                    paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+                }
+            } catch (e: TimeoutCancellationException) {
+                logger.warn("Payment $paymentId deadline exceeded during HTTP call")
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
