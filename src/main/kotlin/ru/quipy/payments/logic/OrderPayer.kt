@@ -69,7 +69,7 @@ class OrderPayer(registry: MeterRegistry) {
             .register(registry)
     }
 
-    private val ingressRate = 4000
+    private val ingressRate = 5500
     private val limiter = TokenBucketRateLimiter(
         rate = ingressRate,
         bucketMaxCapacity = ingressRate * 2,
@@ -78,12 +78,12 @@ class OrderPayer(registry: MeterRegistry) {
     )
 
     private val paymentScope = CoroutineScope(
-        Dispatchers.IO.limitedParallelism(256) +
+        Dispatchers.IO +
                 SupervisorJob() +
                 CoroutineName("payment-scope")
     )
 
-    private val inFlightSemaphore = Semaphore(2200)
+    private val inFlightSemaphore = Semaphore(8000)
 
 
     suspend fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
@@ -139,11 +139,7 @@ class OrderPayer(registry: MeterRegistry) {
 
             // Сразу идём к платежу, пока deadline ещё актуален
             try {
-                withTimeout((remainingAfterCreate - 30).coerceAtLeast(1)) {
-                    paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
-                }
-            } catch (e: TimeoutCancellationException) {
-                logger.warn("Payment $paymentId deadline exceeded during HTTP call")
+                paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {

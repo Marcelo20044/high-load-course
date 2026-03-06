@@ -116,7 +116,7 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        logger.warn("[$accountName] Submitting payment request for payment $paymentId")
+        logger.debug("[{}] Submitting payment request for payment {}", accountName, paymentId)
 
         val transactionId = UUID.randomUUID()
 
@@ -126,7 +126,7 @@ class PaymentExternalSystemAdapterImpl(
             }
         }
 
-        logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+        logger.debug("[{}] Submit: {} , txId: {}", accountName, paymentId, transactionId)
 
         executePaymentWithRetriesAsync(paymentId, amount, transactionId, deadline)
             .whenComplete { result, throwable ->
@@ -332,9 +332,13 @@ class PaymentExternalSystemAdapterImpl(
                         )
                     }
 
-                    logger.warn(
-                        "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, " +
-                                "succeeded: ${body.result}, message: ${body.message}"
+                    logger.debug(
+                        "[{}] Payment processed for txId: {}, payment: {}, succeeded: {}, message: {}",
+                        accountName,
+                        transactionId,
+                        paymentId,
+                        body.result,
+                        body.message
                     )
 
                     if (body.result) {
@@ -371,7 +375,7 @@ class PaymentExternalSystemAdapterImpl(
                 releaseSlot()
                 recordDuration(startAll)
 
-                logger.warn("[$accountName] Retry: $retryCount: request failed for txId=$transactionId", ex)
+                logger.debug("[{}] Retry: {}: request failed for txId={}", accountName, retryCount, transactionId, ex)
 
                 if (retryCount >= maxRetries || now() + backoffMs >= deadline) {
                     future.complete(PaymentResult(false, "Request timeout: ${ex.message}"))
