@@ -2,6 +2,9 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.github.resilience4j.circuitbreaker.CircuitBreaker
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry
 import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.Timer
@@ -70,6 +73,22 @@ class PaymentExternalSystemAdapterImpl(
 
     private val semaphore = Semaphore(parallelRequests, true)
     private val limiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+
+    private val cbWaitDuration = Duration.ofSeconds(5)
+
+    private val circuitBreaker: CircuitBreaker = CircuitBreakerRegistry.of(
+        CircuitBreakerConfig.custom()
+            .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
+            .slidingWindowSize(100)
+            .minimumNumberOfCalls(20)
+            .failureRateThreshold(50f)
+            .slowCallRateThreshold(80f)
+            .slowCallDurationThreshold(Duration.ofMillis(callTimeoutMs))
+            .waitDurationInOpenState(cbWaitDuration)
+            .permittedNumberOfCallsInHalfOpenState(10)
+            .recordExceptions(Exception::class.java)
+            .build()
+    ).circuitBreaker("payment-$accountName")
 
     private val scheduledExecutor = ScheduledThreadPoolExecutor(
         10,
@@ -236,6 +255,20 @@ class PaymentExternalSystemAdapterImpl(
             return future
         }
 
+        if (!circuitBreaker.tryAcquirePermission()) {
+            semaphore.release()
+            logger.warn("[$accountName] Circuit breaker OPEN for payment $paymentId, will retry after wait")
+            val cbWaitMs = cbWaitDuration.toMillis()
+            if (now() + cbWaitMs >= deadline) {
+                return CompletableFuture.completedFuture(
+                    PaymentResult(false, "Circuit breaker open, deadline exceeded")
+                )
+            }
+            val future = CompletableFuture<PaymentResult>()
+            scheduleRetry(cbWaitMs, paymentId, amount, transactionId, deadline, retryCount, backoffMs, future)
+            return future
+        }
+
         activeRequests.incrementAndGet()
         val future = CompletableFuture<PaymentResult>()
 
@@ -257,6 +290,7 @@ class PaymentExternalSystemAdapterImpl(
 
         client.execute(request, object : FutureCallback<SimpleHttpResponse> {
             override fun completed(response: SimpleHttpResponse) {
+                val callDuration = now() - startAll
                 releaseSlot()
                 recordDuration(startAll)
 
@@ -267,6 +301,8 @@ class PaymentExternalSystemAdapterImpl(
                         || status == REQUEST_TIMEOUT_408
                         || status >= INTERNAL_SERVER_ERROR_500
                     ) {
+                        circuitBreaker.onError(callDuration, TimeUnit.MILLISECONDS, RuntimeException("HTTP $status"))
+
                         var newBackoffMs = backoffMs
 
                         if (status == TOO_MANY_REQUESTS_429) {
@@ -330,6 +366,8 @@ class PaymentExternalSystemAdapterImpl(
                         )
                     }
 
+                    circuitBreaker.onSuccess(callDuration, TimeUnit.MILLISECONDS)
+
                     logger.warn(
                         "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, " +
                                 "succeeded: ${body.result}, message: ${body.message}"
@@ -360,15 +398,18 @@ class PaymentExternalSystemAdapterImpl(
                         future.complete(PaymentResult(false, body.message))
                     }
                 } catch (e: Exception) {
+                    circuitBreaker.onError(callDuration, TimeUnit.MILLISECONDS, e)
                     logger.error("[$accountName] Error processing response for txId=$transactionId", e)
                     future.completeExceptionally(e)
                 }
             }
 
             override fun failed(ex: Exception) {
+                val callDuration = now() - startAll
                 releaseSlot()
                 recordDuration(startAll)
 
+                circuitBreaker.onError(callDuration, TimeUnit.MILLISECONDS, ex)
                 logger.warn("[$accountName] Retry: $retryCount: request failed for txId=$transactionId", ex)
 
                 if (retryCount >= maxRetries || now() + backoffMs >= deadline) {
@@ -392,8 +433,10 @@ class PaymentExternalSystemAdapterImpl(
             }
 
             override fun cancelled() {
+                val callDuration = now() - startAll
                 releaseSlot()
                 recordDuration(startAll)
+                circuitBreaker.onSuccess(callDuration, TimeUnit.MILLISECONDS)
                 future.complete(PaymentResult(false, "Request cancelled"))
             }
         })
